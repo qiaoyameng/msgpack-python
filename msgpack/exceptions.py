@@ -7,6 +7,24 @@ class UnpackException(Exception):
     """
 
 
+class UnpackDiagnostic:
+    """Position and path information captured when unpacking fails."""
+
+    __slots__ = ("offset", "object_start", "path", "path_text")
+
+    def __init__(self, offset, object_start, path, path_text):
+        self.offset = offset
+        self.object_start = object_start
+        self.path = path
+        self.path_text = path_text
+
+    def __str__(self):
+        return (
+            f"offset={self.offset}, object_start={self.object_start}, "
+            f"path={self.path_text!r}"
+        )
+
+
 class BufferFull(UnpackException):
     pass
 
