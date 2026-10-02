@@ -1,6 +1,7 @@
 # ruff: noqa: F401
 import os
 
+from ._binary_edit import DELETE, INSERT, REPLACE, deleteb, editb, insertb, replaceb
 from .exceptions import *  # noqa: F403
 from .ext import ExtType, Timestamp
 

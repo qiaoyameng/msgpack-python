@@ -956,3 +956,23 @@ class Packer:
             return memoryview(self.bytes())
         else:
             return self._buffer.getbuffer()
+
+
+def __getattr__(name):
+    if name == "DuplicateMapKeyError":
+        from .exceptions import DuplicateMapKeyError
+
+        return DuplicateMapKeyError
+    if name in {
+        "DELETE",
+        "INSERT",
+        "REPLACE",
+        "deleteb",
+        "editb",
+        "insertb",
+        "replaceb",
+    }:
+        from . import _binary_edit
+
+        return getattr(_binary_edit, name)
+    raise AttributeError(name)

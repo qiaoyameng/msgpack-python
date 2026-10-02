@@ -42,6 +42,10 @@ class ExtraData(UnpackValueError):
         return "unpack(b) received extra data."
 
 
+class DuplicateMapKeyError(KeyError):
+    """Raised when a path matches more than one key in a MessagePack map."""
+
+
 # Deprecated.  Use Exception instead to catch all exception during packing.
 PackException = Exception
 PackValueError = ValueError

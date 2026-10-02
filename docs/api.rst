@@ -19,6 +19,14 @@ API reference
 
 ``loads()`` is an alias for :func:`unpackb`
 
+.. autofunction:: editb
+
+.. autofunction:: replaceb
+
+.. autofunction:: deleteb
+
+.. autofunction:: insertb
+
 .. autoclass:: Packer
     :members:
 

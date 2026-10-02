@@ -151,6 +151,29 @@ in the upcoming container, so that each element in an array, or key-value pair
 in a map, can be unpacked or skipped individually.
 
 
+### Binary path editing
+
+Large MessagePack documents can be edited without unpacking and repacking the
+whole object. `editb()` walks the container structure, splices in the packed
+replacement, and rewrites affected container headers when counts cross
+fixarray/fixmap, array16/map16, or array32/map32 boundaries. Untouched
+branches retain their original bytes, and ext payloads are skipped opaquely.
+
+```pycon
+>>> packed = msgpack.packb({"users": {"id": 1, "blob": b"large"}}, use_bin_type=True)
+>>> edited = msgpack.replaceb(packed, ("users", "id"), 2)
+>>> msgpack.unpackb(edited)["users"]["id"]
+2
+>>> edited = msgpack.insertb(edited, ("users",), "name", "alice")
+>>> edited = msgpack.deleteb(edited, ("users", "blob"))
+```
+
+Array path components are indexes. Map components are keys. By default map
+keys are decoded as strings; pass `raw=True` to address byte-string or binary
+keys. If a path component matches duplicate map keys, `DuplicateMapKeyError`
+is raised instead of selecting one occurrence.
+
+
 ## Notes
 
 ### String and binary types in the old MessagePack spec
