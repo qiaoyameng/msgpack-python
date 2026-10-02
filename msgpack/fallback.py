@@ -138,6 +138,43 @@ _MSGPACK_HEADERS = {
 }
 
 
+_MISSING = object()
+
+
+class _Checkpoint:
+    """A rewind point returned by :meth:`Unpacker.checkpoint`.
+
+    ``pos`` is the absolute stream position of the rewind point and
+    ``idx`` its index in the internal buffer.
+    """
+
+    __slots__ = ("pos", "idx", "unpacker")
+
+    def __init__(self, pos, idx):
+        self.pos = pos
+        self.idx = idx
+
+    def rollback(self):
+        """Rewind the owning unpacker to this checkpoint and discard it."""
+        self.unpacker.rollback(self)
+
+    def commit(self):
+        """Keep bytes read since this checkpoint and discard it."""
+        self.unpacker.commit(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        active = any(cp is self for cp in self.unpacker._checkpoints)
+        if exc_type is not None and active:
+            self.rollback()
+            return False
+        if active:
+            self.commit()
+        return False
+
+
 class Unpacker:
     """Streaming unpacker.
 
@@ -227,6 +264,30 @@ class Unpacker:
             for o in unpacker:
                 process(o)
 
+    Speculative (trial) reads are supported with checkpoints::
+
+        cp = unpacker.checkpoint()
+        try:
+            obj = unpacker.unpack()
+        except OutOfData:
+            unpacker.rollback(cp)  # wait for more bytes, no data is lost
+        else:
+            unpacker.commit(cp)    # or keep the read position
+
+    ``checkpoint()`` returns a context manager, so the block above can be
+    written as ``with unpacker.checkpoint(): obj = unpacker.unpack()``; an
+    exception inside the block rolls back automatically.
+
+    Checkpoints nest and must be released in LIFO order.  The bytes an
+    active checkpoint may need to re-read are retained, but only up to
+    ``max_buffer_size``: ``feed()`` raises ``BufferFull`` at that boundary
+    instead of buffering an unbounded amount of the stream.  ``tell()``,
+    ``unpack()``, ``skip()``, ``read_array_header()``, ``read_map_header()``
+    and ``read_bytes()`` all honor the same cursor; a rollback moves it back
+    to the checkpoint.  When an ``ext_hook`` already produced an object for a
+    byte range, re-reading that range after a rollback reuses the cached
+    object instead of calling the hook (and its side effects) again.
+
     Raises ``ExtraData`` when *packed* contains extra bytes.
     Raises ``OutOfData`` when *packed* is incomplete.
     Raises ``FormatError`` when *packed* is not valid msgpack.
@@ -315,6 +376,15 @@ class Unpacker:
         self._max_ext_len = max_ext_len
         self._stream_offset = 0
 
+        #: Stack of active user checkpoints (innermost last).
+        self._checkpoints = []
+
+        #: Maps absolute start offset of an ext object to the object returned
+        #: by ext_hook, for every ext object whose bytes are still retained.
+        #: Re-reading after a rollback reuses this instead of calling the
+        #: user callback a second time.
+        self._ext_cache = {}
+
         if list_hook is not None and not callable(list_hook):
             raise TypeError("`list_hook` is not callable")
         if object_hook is not None and not callable(object_hook):
@@ -329,23 +399,124 @@ class Unpacker:
     def feed(self, next_bytes):
         assert self._feeding
         view = _get_data_from_buffer(next_bytes)
-        if len(self._buffer) - self._buff_i + len(view) > self._max_buffer_size:
+        # Bytes at or after the retain floor must stay in the buffer: they
+        # are either unread data or bytes an active checkpoint may need to
+        # re-read after a rollback.  Everything before the floor is
+        # reclaimable (the strip below discards it), so the window from the
+        # floor to the end, plus the newly fed bytes, is what counts.
+        floor = self._retain_floor()
+        if len(self._buffer) - floor + len(view) > self._max_buffer_size:
             raise BufferFull
 
         # Strip buffer before checkpoint before reading file.
-        if self._buf_checkpoint > 0:
-            del self._buffer[: self._buf_checkpoint]
-            self._buff_i -= self._buf_checkpoint
-            self._buf_checkpoint = 0
+        if floor > 0:
+            del self._buffer[:floor]
+            self._buff_i -= floor
+            self._buf_checkpoint -= floor
+            for cp in self._checkpoints:
+                cp.idx -= floor
+            self._discard_ext_cache(self._stream_offset + floor)
 
         # Use extend here: INPLACE_ADD += doesn't reliably typecast memoryview in jython
         self._buffer.extend(view if view.contiguous else view.tobytes())
         view.release()
 
     def _consume(self):
-        """Gets rid of the used parts of the buffer."""
+        """Mark bytes read so far as consumed.
+
+        An active user checkpoint is a hard rewind point: the consume
+        position may only advance up to it, never past it.
+        """
+        if self._checkpoints:
+            floor_idx = self._checkpoints[0].idx
+            if self._buff_i >= floor_idx:
+                # The consume floor may not pass the oldest active checkpoint.
+                self._buf_checkpoint = floor_idx
+                return
         self._stream_offset += self._buff_i - self._buf_checkpoint
         self._buf_checkpoint = self._buff_i
+
+    def _retain_floor(self):
+        """Index below which the buffer may currently be stripped."""
+        floor = self._buf_checkpoint
+        if self._checkpoints:
+            oldest_idx = self._checkpoints[0].idx
+            if oldest_idx < floor:
+                floor = oldest_idx
+        return floor
+
+    def _abs_pos(self):
+        """Absolute stream position of ``self._buff_i``."""
+        return self._stream_offset + self._buff_i - self._buf_checkpoint
+
+    def _discard_ext_cache(self, upto):
+        """Drop cached ext results starting before absolute offset *upto*."""
+        if not self._ext_cache:
+            return
+        for key in [k for k in self._ext_cache if k < upto]:
+            del self._ext_cache[key]
+
+    def _remember_ext(self, start, obj):
+        """Cache *obj* (produced by ext_hook at absolute offset *start*).
+
+        Only worth remembering while a checkpoint may cause a re-read.
+        """
+        if self._checkpoints:
+            self._ext_cache[start] = obj
+
+    def _recall_ext(self, start):
+        """Return cached ext object at *start*, or ``_MISSING``."""
+        return self._ext_cache.get(start, _MISSING)
+
+    def checkpoint(self):
+        """Mark the current read position as a rewind point.
+
+        Returns a :class:`_Checkpoint`.  Call ``commit(checkpoint)`` to keep
+        bytes read since the checkpoint, or ``rollback(checkpoint)`` to
+        rewind to it.  Checkpoints nest and must be released in LIFO order.
+
+        While a checkpoint is active, bytes it needs to re-read are retained
+        in the buffer; ``feed()`` raises ``BufferFull`` once the retained
+        window reaches ``max_buffer_size`` instead of growing without bound.
+        """
+        cp = _Checkpoint(self._abs_pos(), self._buff_i)
+        cp.unpacker = self
+        self._checkpoints.append(cp)
+        return cp
+
+    def _release_checkpoint(self, checkpoint, rollback):
+        index = next(
+            (i for i, cp in enumerate(self._checkpoints) if cp is checkpoint), -1
+        )
+        if index < 0:
+            raise RuntimeError("checkpoint is not active")
+        if index != len(self._checkpoints) - 1:
+            raise RuntimeError("checkpoints must be released in LIFO order")
+        self._checkpoints.pop()
+        if rollback:
+            # The consume floor never passed the rolled-back checkpoint, so
+            # rewind the cursor but leave the consume point untouched.
+            self._buff_i = checkpoint.idx
+            return
+        # Commit: keep the bytes read since the checkpoint.  Re-establish the
+        # consume floor against the (possibly) new oldest checkpoint.
+        self._consume()
+
+    def rollback(self, checkpoint=None):
+        """Rewind read position to *checkpoint* (default: innermost) and release it."""
+        if checkpoint is None:
+            if not self._checkpoints:
+                raise RuntimeError("no active checkpoint")
+            checkpoint = self._checkpoints[-1]
+        self._release_checkpoint(checkpoint, rollback=True)
+
+    def commit(self, checkpoint=None):
+        """Keep bytes read since *checkpoint* (default: innermost) and release it."""
+        if checkpoint is None:
+            if not self._checkpoints:
+                raise RuntimeError("no active checkpoint")
+            checkpoint = self._checkpoints[-1]
+        self._release_checkpoint(checkpoint, rollback=False)
 
     def _got_extradata(self):
         return self._buff_i < len(self._buffer)
@@ -374,14 +545,18 @@ class Unpacker:
             return
 
         if self._feeding:
-            self._buff_i = self._buf_checkpoint
+            self._buff_i = self._rollback_pos()
             raise OutOfData
 
         # Strip buffer before checkpoint before reading file.
-        if self._buf_checkpoint > 0:
-            del self._buffer[: self._buf_checkpoint]
-            self._buff_i -= self._buf_checkpoint
-            self._buf_checkpoint = 0
+        floor = self._retain_floor()
+        if floor > 0:
+            del self._buffer[:floor]
+            self._buff_i -= floor
+            self._buf_checkpoint -= floor
+            for cp in self._checkpoints:
+                cp.idx -= floor
+            self._discard_ext_cache(self._stream_offset + floor)
 
         # Read from file
         remain_bytes = -remain_bytes
@@ -397,8 +572,14 @@ class Unpacker:
             remain_bytes -= len(read_data)
 
         if len(self._buffer) < n + self._buff_i and raise_outofdata:
-            self._buff_i = 0  # rollback
+            self._buff_i = self._rollback_pos()  # rollback
             raise OutOfData
+
+    def _rollback_pos(self):
+        """Read position to restore when an object cannot be completed."""
+        if self._checkpoints:
+            return self._checkpoints[-1].idx
+        return self._buf_checkpoint
 
     def _read_header(self):
         typ = TYPE_IMMEDIATE
@@ -497,6 +678,7 @@ class Unpacker:
         return typ, n, obj
 
     def _unpack(self, execute=EX_CONSTRUCT):
+        obj_start = self._abs_pos()
         typ, n, obj = self._read_header()
 
         if execute == EX_READ_ARRAY_HEADER:
@@ -572,7 +754,12 @@ class Unpacker:
                 else:
                     return ts
             else:
-                return self._ext_hook(n, bytes(obj))
+                cached = self._recall_ext(obj_start)
+                if cached is not _MISSING:
+                    return cached
+                result = self._ext_hook(n, bytes(obj))
+                self._remember_ext(obj_start, result)
+                return result
         assert typ == TYPE_IMMEDIATE
         return obj
 
@@ -618,7 +805,13 @@ class Unpacker:
         return ret
 
     def tell(self):
-        return self._stream_offset
+        """Absolute stream position of the current read cursor.
+
+        This advances with bytes read by ``unpack``/``skip``/
+        ``read_array_header``/``read_map_header``/``read_bytes`` and moves
+        back to the saved position after a checkpoint rollback.
+        """
+        return self._stream_offset + self._buff_i - self._buf_checkpoint
 
 
 class Packer:
