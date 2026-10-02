@@ -64,6 +64,12 @@ TYPE_BIN = 4
 TYPE_EXT = 5
 
 DEFAULT_RECURSE_LIMIT = 1024
+DEFAULT_MAX_BIN_VIEW_BUFFER_SIZE = 16 * 1024
+_MEMORYVIEW_TOREADONLY = hasattr(memoryview, "toreadonly")
+
+
+class _TrackedBuffer(bytearray):
+    pass
 
 
 def _check_type_strict(obj, t, type=type, tuple=tuple):
@@ -158,6 +164,10 @@ class Unpacker:
         If true, unpack msgpack raw to Python bytes.
         Otherwise, unpack to Python str by decoding with UTF-8 encoding (default).
 
+    :param bool bin_view:
+        If true, unpack msgpack bin to a read-only ``memoryview``.
+        The default (false) returns ``bytes``.
+
     :param int timestamp:
         Control how timestamp type is unpacked:
 
@@ -189,6 +199,13 @@ class Unpacker:
         The default value is 100*1024*1024 (100MiB).
         Raises `BufferFull` exception when it is insufficient.
         You should set this parameter when unpacking data from untrusted source.
+
+    :param int max_bin_view_buffer_size:
+        When *bin_view* is enabled, return a zero-copy view only when the
+        unpacker's backing buffer is no larger than this value.  Larger
+        buffers are copied so a small bin value cannot keep a large stream
+        alive.  Release the returned memoryview to allow its backing buffer to
+        be reclaimed.  (default: 16 KiB)
 
     :param int max_str_len:
         Deprecated, use *max_buffer_size* instead.
@@ -241,6 +258,7 @@ class Unpacker:
         read_size=0,
         use_list=True,
         raw=False,
+        bin_view=False,
         timestamp=0,
         strict_map_key=True,
         object_hook=None,
@@ -248,6 +266,7 @@ class Unpacker:
         list_hook=None,
         unicode_errors=None,
         max_buffer_size=100 * 1024 * 1024,
+        max_bin_view_buffer_size=DEFAULT_MAX_BIN_VIEW_BUFFER_SIZE,
         ext_hook=ExtType,
         max_str_len=-1,
         max_bin_len=-1,
@@ -267,7 +286,7 @@ class Unpacker:
             self._feeding = False
 
         #: array of bytes fed.
-        self._buffer = bytearray()
+        self._buffer = _TrackedBuffer()
         #: Which position we currently reads
         self._buff_i = 0
 
@@ -282,6 +301,8 @@ class Unpacker:
 
         if not max_buffer_size:
             max_buffer_size = 2**31 - 1
+        if max_bin_view_buffer_size < 0:
+            raise ValueError("max_bin_view_buffer_size must be non-negative")
         if max_str_len == -1:
             max_str_len = max_buffer_size
         if max_bin_len == -1:
@@ -298,6 +319,8 @@ class Unpacker:
             raise ValueError("read_size must be smaller than max_buffer_size")
         self._read_size = read_size or min(self._max_buffer_size, 16 * 1024)
         self._raw = bool(raw)
+        self._bin_view = bool(bin_view)
+        self._max_bin_view_buffer_size = max_bin_view_buffer_size
         self._strict_map_key = bool(strict_map_key)
         self._unicode_errors = unicode_errors
         self._use_list = use_list
@@ -314,6 +337,7 @@ class Unpacker:
         self._max_map_len = max_map_len
         self._max_ext_len = max_ext_len
         self._stream_offset = 0
+        self._buffer_has_shared_bin_view = False
 
         if list_hook is not None and not callable(list_hook):
             raise TypeError("`list_hook` is not callable")
@@ -329,18 +353,29 @@ class Unpacker:
     def feed(self, next_bytes):
         assert self._feeding
         view = _get_data_from_buffer(next_bytes)
-        if len(self._buffer) - self._buff_i + len(view) > self._max_buffer_size:
+        self._discard_consumed_prefix()
+        if self._buffer_has_shared_bin_view:
+            self._buffer = _TrackedBuffer(self._buffer)
+            self._buffer_has_shared_bin_view = False
+        if len(self._buffer) + len(view) > self._max_buffer_size:
             raise BufferFull
-
-        # Strip buffer before checkpoint before reading file.
-        if self._buf_checkpoint > 0:
-            del self._buffer[: self._buf_checkpoint]
-            self._buff_i -= self._buf_checkpoint
-            self._buf_checkpoint = 0
 
         # Use extend here: INPLACE_ADD += doesn't reliably typecast memoryview in jython
         self._buffer.extend(view if view.contiguous else view.tobytes())
         view.release()
+
+    def _discard_consumed_prefix(self):
+        checkpoint = self._buf_checkpoint
+        if checkpoint <= 0:
+            return
+
+        if self._buffer_has_shared_bin_view:
+            self._buffer = _TrackedBuffer(self._buffer[checkpoint:])
+            self._buffer_has_shared_bin_view = False
+        else:
+            del self._buffer[:checkpoint]
+        self._buff_i -= checkpoint
+        self._buf_checkpoint = 0
 
     def _consume(self):
         """Gets rid of the used parts of the buffer."""
@@ -366,6 +401,26 @@ class Unpacker:
         self._buff_i = i + len(ret)
         return ret
 
+    def _read_bin(self, n):
+        self._reserve(n)
+        if not n:
+            return memoryview(b"") if self._bin_view else b""
+        i = self._buff_i
+        view = memoryview(self._buffer)[i : i + n]
+        if self._bin_view:
+            if (
+                _MEMORYVIEW_TOREADONLY
+                and len(self._buffer) <= self._max_bin_view_buffer_size
+            ):
+                ret = view.toreadonly()
+                self._buffer_has_shared_bin_view = True
+            else:
+                ret = memoryview(bytes(view))
+        else:
+            ret = bytes(view)
+        self._buff_i = i + n
+        return ret
+
     def _reserve(self, n, raise_outofdata=True):
         remain_bytes = len(self._buffer) - self._buff_i - n
 
@@ -377,15 +432,13 @@ class Unpacker:
             self._buff_i = self._buf_checkpoint
             raise OutOfData
 
-        # Strip buffer before checkpoint before reading file.
-        if self._buf_checkpoint > 0:
-            del self._buffer[: self._buf_checkpoint]
-            self._buff_i -= self._buf_checkpoint
-            self._buf_checkpoint = 0
+        self._discard_consumed_prefix()
+        if self._buffer_has_shared_bin_view:
+            self._buffer = _TrackedBuffer(self._buffer)
+            self._buffer_has_shared_bin_view = False
 
-        # Read from file
-        remain_bytes = -remain_bytes
-        if remain_bytes + len(self._buffer) > self._max_buffer_size:
+        remain_bytes = max(0, n - len(self._buffer) + self._buff_i)
+        if len(self._buffer) + remain_bytes > self._max_buffer_size:
             raise BufferFull
         while remain_bytes > 0:
             to_read_bytes = max(self._read_size, remain_bytes)
@@ -443,7 +496,7 @@ class Unpacker:
             self._buff_i += size
             if n > self._max_bin_len:
                 raise ValueError(f"{n} exceeds max_bin_len({self._max_bin_len})")
-            obj = self._read(n)
+            obj = self._read_bin(n)
         elif 0xC7 <= b <= 0xC9:
             size, fmt, typ = _MSGPACK_HEADERS[b]
             self._reserve(size)
@@ -533,6 +586,8 @@ class Unpacker:
                 def _gen():
                     for _ in range(n):
                         key = self._unpack(EX_CONSTRUCT)
+                        if isinstance(key, memoryview):
+                            key = key.tobytes()
                         if self._strict_map_key and type(key) not in (str, bytes):
                             raise ValueError("%s is not allowed for map key" % str(type(key)))
                         yield key, self._unpack(EX_CONSTRUCT)
@@ -542,6 +597,8 @@ class Unpacker:
                 ret = {}
                 for _ in range(n):
                     key = self._unpack(EX_CONSTRUCT)
+                    if isinstance(key, memoryview):
+                        key = key.tobytes()
                     if self._strict_map_key and type(key) not in (str, bytes):
                         raise ValueError("%s is not allowed for map key" % str(type(key)))
                     if isinstance(key, str):
@@ -559,7 +616,7 @@ class Unpacker:
                 obj = obj.decode("utf_8", self._unicode_errors)
             return obj
         if typ == TYPE_BIN:
-            return bytes(obj)
+            return obj
         if typ == TYPE_EXT:
             if n == -1:  # timestamp
                 ts = Timestamp.from_bytes(bytes(obj))
