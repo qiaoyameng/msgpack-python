@@ -2,6 +2,7 @@
 
 import struct
 import sys
+import weakref
 from datetime import datetime as _DateTime
 
 if hasattr(sys, "pypy_version_info"):
@@ -138,6 +139,43 @@ _MSGPACK_HEADERS = {
 }
 
 
+class _Checkpoint:
+    __slots__ = ("position", "_unpacker_ref", "active")
+
+    def __init__(self, unpacker, position):
+        self.position = position
+        self._unpacker_ref = weakref.ref(unpacker)
+        self.active = True
+
+    def _unpacker(self):
+        unpacker = self._unpacker_ref()
+        if unpacker is None:
+            raise RuntimeError("unpacker is no longer available")
+        return unpacker
+
+    def commit(self):
+        if not self.active:
+            raise RuntimeError("checkpoint is no longer active")
+        self._unpacker().commit(self)
+
+    def rollback(self):
+        if not self.active:
+            raise RuntimeError("checkpoint is no longer active")
+        self._unpacker().rollback(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self.active:
+            return False
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+
 class Unpacker:
     """Streaming unpacker.
 
@@ -270,6 +308,8 @@ class Unpacker:
         self._buffer = bytearray()
         #: Which position we currently reads
         self._buff_i = 0
+        #: Absolute stream position of self._buffer[0]
+        self._buffer_offset = 0
 
         # When Unpacker is used as an iterable, between the calls to next(),
         # the buffer is not "consumed" completely, for efficiency sake.
@@ -279,6 +319,8 @@ class Unpacker:
         # we raise an OutOfData) we need to rollback the buffer to the correct
         # state, which _buf_checkpoint records.
         self._buf_checkpoint = 0
+        self._checkpoints = []
+        self._ext_results = {}
 
         if not max_buffer_size:
             max_buffer_size = 2**31 - 1
@@ -326,17 +368,75 @@ class Unpacker:
         if not callable(ext_hook):
             raise TypeError("`ext_hook` is not callable")
 
+    def checkpoint(self):
+        """Create a nested, LIFO rollback point and return a token.
+
+        Data from the oldest active checkpoint is retained so it can be read
+        again after rollback.  ``max_buffer_size`` still limits that retained
+        window.  Extension hook results and exceptions are reused when bytes
+        covered by a checkpoint are read again.
+        """
+        checkpoint = _Checkpoint(self, self._absolute_position())
+        self._checkpoints.append(checkpoint)
+        return checkpoint
+
+    def commit(self, checkpoint=None):
+        """Commit the newest checkpoint, or the specified checkpoint."""
+        checkpoint = self._get_checkpoint(checkpoint)
+        self._checkpoints.pop()
+        checkpoint.active = False
+        self._trim_buffer()
+
+    def rollback(self, checkpoint=None):
+        """Roll back to the newest checkpoint, or the specified checkpoint."""
+        checkpoint = self._get_checkpoint(checkpoint)
+        position = checkpoint.position
+        self._checkpoints.pop()
+        checkpoint.active = False
+
+        self._buff_i = position - self._buffer_offset
+        self._buf_checkpoint = self._buff_i
+        self._stream_offset = position
+        self._trim_buffer()
+
+    def _get_checkpoint(self, checkpoint):
+        if not self._checkpoints:
+            raise RuntimeError("no active checkpoint")
+        if checkpoint is None:
+            return self._checkpoints[-1]
+        if self._checkpoints[-1] is not checkpoint:
+            raise RuntimeError("checkpoints must be committed or rolled back in LIFO order")
+        if checkpoint._unpacker_ref() is not self:
+            raise RuntimeError("checkpoint belongs to another unpacker")
+        return checkpoint
+
+    def _absolute_position(self):
+        return self._buffer_offset + self._buff_i
+
+    def _trim_buffer(self):
+        if self._checkpoints:
+            retain_position = self._checkpoints[0].position
+        else:
+            retain_position = self._stream_offset
+        retain_i = retain_position - self._buffer_offset
+        if retain_i <= 0:
+            return
+
+        del self._buffer[:retain_i]
+        self._buffer_offset += retain_i
+        self._buff_i -= retain_i
+        self._buf_checkpoint -= retain_i
+
+        for position in list(self._ext_results):
+            if position < self._buffer_offset:
+                del self._ext_results[position]
+
     def feed(self, next_bytes):
         assert self._feeding
         view = _get_data_from_buffer(next_bytes)
-        if len(self._buffer) - self._buff_i + len(view) > self._max_buffer_size:
+        self._trim_buffer()
+        if len(self._buffer) + len(view) > self._max_buffer_size:
             raise BufferFull
-
-        # Strip buffer before checkpoint before reading file.
-        if self._buf_checkpoint > 0:
-            del self._buffer[: self._buf_checkpoint]
-            self._buff_i -= self._buf_checkpoint
-            self._buf_checkpoint = 0
 
         # Use extend here: INPLACE_ADD += doesn't reliably typecast memoryview in jython
         self._buffer.extend(view if view.contiguous else view.tobytes())
@@ -344,7 +444,7 @@ class Unpacker:
 
     def _consume(self):
         """Gets rid of the used parts of the buffer."""
-        self._stream_offset += self._buff_i - self._buf_checkpoint
+        self._stream_offset = self._buffer_offset + self._buff_i
         self._buf_checkpoint = self._buff_i
 
     def _got_extradata(self):
@@ -377,18 +477,15 @@ class Unpacker:
             self._buff_i = self._buf_checkpoint
             raise OutOfData
 
-        # Strip buffer before checkpoint before reading file.
-        if self._buf_checkpoint > 0:
-            del self._buffer[: self._buf_checkpoint]
-            self._buff_i -= self._buf_checkpoint
-            self._buf_checkpoint = 0
+        self._trim_buffer()
 
         # Read from file
         remain_bytes = -remain_bytes
         if remain_bytes + len(self._buffer) > self._max_buffer_size:
             raise BufferFull
         while remain_bytes > 0:
-            to_read_bytes = max(self._read_size, remain_bytes)
+            allowed = self._max_buffer_size - len(self._buffer)
+            to_read_bytes = min(max(self._read_size, remain_bytes), allowed)
             read_data = self.file_like.read(to_read_bytes)
             if not read_data:
                 break
@@ -397,7 +494,7 @@ class Unpacker:
             remain_bytes -= len(read_data)
 
         if len(self._buffer) < n + self._buff_i and raise_outofdata:
-            self._buff_i = 0  # rollback
+            self._buff_i = self._buf_checkpoint
             raise OutOfData
 
     def _read_header(self):
@@ -497,6 +594,7 @@ class Unpacker:
         return typ, n, obj
 
     def _unpack(self, execute=EX_CONSTRUCT):
+        object_start = self._absolute_position()
         typ, n, obj = self._read_header()
 
         if execute == EX_READ_ARRAY_HEADER:
@@ -572,7 +670,21 @@ class Unpacker:
                 else:
                     return ts
             else:
-                return self._ext_hook(n, bytes(obj))
+                cached = self._ext_results.get(object_start)
+                if cached is not None:
+                    succeeded, result = cached
+                    if succeeded:
+                        return result
+                    raise result
+                try:
+                    result = self._ext_hook(n, bytes(obj))
+                except Exception as exc:
+                    if self._checkpoints:
+                        self._ext_results[object_start] = (False, exc)
+                    raise
+                if self._checkpoints:
+                    self._ext_results[object_start] = (True, result)
+                return result
         assert typ == TYPE_IMMEDIATE
         return obj
 
@@ -618,7 +730,7 @@ class Unpacker:
         return ret
 
     def tell(self):
-        return self._stream_offset
+        return self._absolute_position()
 
 
 class Packer:

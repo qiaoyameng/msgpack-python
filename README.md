@@ -150,6 +150,24 @@ the result, or ignoring it. The latter two methods return the number of elements
 in the upcoming container, so that each element in an array, or key-value pair
 in a map, can be unpacked or skipped individually.
 
+The pure-Python unpacker also supports bounded checkpoints for protocol
+probing. Create a checkpoint, try one or more unpacking operations, and either
+commit it or roll back to the checkpoint position. Checkpoints are nested and
+must be committed or rolled back in LIFO order. Bytes fed during a checkpoint
+are retained for rollback until it ends, but `max_buffer_size` still limits
+the retained window. Results from `ext_hook` are reused when the same bytes
+are unpacked after rollback.
+
+```py
+checkpoint = unpacker.checkpoint()
+try:
+    unpacker.read_array_header()
+except msgpack.OutOfData:
+    checkpoint.rollback()
+else:
+    checkpoint.commit()
+```
+
 
 ## Notes
 
