@@ -48,7 +48,14 @@ else:
         pass
 
 
-from .exceptions import BufferFull, ExtraData, FormatError, OutOfData, StackError
+from .exceptions import (
+    BufferFull,
+    ExtraData,
+    FormatError,
+    OutOfData,
+    StackError,
+    UnpackErrorInfo,
+)
 from .ext import ExtType, Timestamp
 
 EX_SKIP = 0
@@ -64,6 +71,40 @@ TYPE_BIN = 4
 TYPE_EXT = 5
 
 DEFAULT_RECURSE_LIMIT = 1024
+MAX_ERROR_PATH_DEPTH = 64
+MAX_ERROR_KEY_LENGTH = 32
+PATH_TRUNCATED = "..."
+UNKNOWN_MAP_KEY = "<map key>"
+
+
+def _bounded_path_component(value):
+    if isinstance(value, str):
+        if len(value) <= MAX_ERROR_KEY_LENGTH:
+            return value
+        return value[:MAX_ERROR_KEY_LENGTH] + PATH_TRUNCATED
+    if isinstance(value, bytes):
+        if len(value) <= MAX_ERROR_KEY_LENGTH:
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        rendered = value[:MAX_ERROR_KEY_LENGTH].hex()
+        if len(value) > MAX_ERROR_KEY_LENGTH:
+            rendered += PATH_TRUNCATED
+        return rendered
+    return "<%s>" % type(value).__name__
+
+
+def _add_error_note(exc, position, object_start, path):
+    if not hasattr(exc, "add_note"):
+        return
+    try:
+        exc.add_note(
+            "MessagePack error at byte %d (object starts at byte %d), path: %r"
+            % (position, object_start, path)
+        )
+    except Exception:
+        pass
 
 
 def _check_type_strict(obj, t, type=type, tuple=tuple):
@@ -96,10 +137,12 @@ def unpackb(packed, **kwargs):
     unpacker.feed(packed)
     try:
         ret = unpacker._unpack()
-    except OutOfData:
-        raise ValueError("Unpack failed: incomplete input")
-    except RecursionError:
-        raise StackError
+    except OutOfData as exc:
+        raise unpacker._replace_exception(
+            exc, ValueError("Unpack failed: incomplete input")
+        ) from exc
+    except RecursionError as exc:
+        raise unpacker._replace_exception(exc, StackError()) from exc
     if unpacker._got_extradata():
         raise ExtraData(ret, unpacker._get_extradata())
     return ret
@@ -314,6 +357,8 @@ class Unpacker:
         self._max_map_len = max_map_len
         self._max_ext_len = max_ext_len
         self._stream_offset = 0
+        self._error_stack = []
+        self._annotated_exception_ids = set()
 
         if list_hook is not None and not callable(list_hook):
             raise TypeError("`list_hook` is not callable")
@@ -347,6 +392,80 @@ class Unpacker:
         self._stream_offset += self._buff_i - self._buf_checkpoint
         self._buf_checkpoint = self._buff_i
 
+    def _absolute_offset(self, buffer_offset=None):
+        if buffer_offset is None:
+            buffer_offset = self._buff_i
+        return self._stream_offset + buffer_offset - self._buf_checkpoint
+
+    def _error_path(self):
+        path = []
+        for frame in self._error_stack[1:]:
+            component = frame[1]
+            if component is not None:
+                path.append(component)
+        return tuple(path)
+
+    def _current_object_start(self):
+        if self._error_stack:
+            return self._error_stack[0][0]
+        return self._absolute_offset(self._buf_checkpoint)
+
+    def _immediate_object_start(self):
+        if self._error_stack:
+            return self._error_stack[-1][0]
+        return self._absolute_offset(self._buf_checkpoint)
+
+    def _annotate_error(self, exc, *, position=None, object_start=None, path=None):
+        try:
+            instance_dict = object.__getattribute__(exc, "__dict__")
+            marked = instance_dict.get("_msgpack_error_annotated", False)
+        except Exception:
+            marked = False
+        if marked or id(exc) in self._annotated_exception_ids:
+            return exc
+
+        if position is None:
+            position = self._immediate_object_start()
+        if object_start is None:
+            object_start = self._current_object_start()
+        if not isinstance(position, int) or position < 0:
+            position = self._immediate_object_start()
+        if not isinstance(object_start, int) or object_start < 0:
+            object_start = self._current_object_start()
+        if path is None:
+            path = self._error_path()
+        info = UnpackErrorInfo(position, object_start, path)
+
+        try:
+            exc._msgpack_error_annotated = True
+            exc.msgpack_error = info
+            exc.position = position
+            exc.offset = position
+            exc.absolute_offset = position
+            exc.object_start = object_start
+            exc.object_start_offset = object_start
+            exc.path = path
+            return exc
+        except Exception:
+            self._annotated_exception_ids.add(id(exc))
+            _add_error_note(exc, position, object_start, path)
+            return exc
+
+    def _replace_exception(self, exc, replacement):
+        info = getattr(exc, "msgpack_error", None)
+        if info is not None:
+            try:
+                replacement.msgpack_error = info
+                replacement.position = info.position
+                replacement.offset = info.position
+                replacement.absolute_offset = info.position
+                replacement.object_start = info.object_start
+                replacement.object_start_offset = info.object_start
+                replacement.path = info.path
+            except Exception:
+                _add_error_note(replacement, info.position, info.object_start, info.path)
+        return replacement
+
     def _got_extradata(self):
         return self._buff_i < len(self._buffer)
 
@@ -374,8 +493,9 @@ class Unpacker:
             return
 
         if self._feeding:
+            position = self._absolute_offset(len(self._buffer))
             self._buff_i = self._buf_checkpoint
-            raise OutOfData
+            raise self._annotate_error(OutOfData(), position=position)
 
         # Strip buffer before checkpoint before reading file.
         if self._buf_checkpoint > 0:
@@ -397,10 +517,19 @@ class Unpacker:
             remain_bytes -= len(read_data)
 
         if len(self._buffer) < n + self._buff_i and raise_outofdata:
+            position = self._absolute_offset(len(self._buffer))
             self._buff_i = 0  # rollback
-            raise OutOfData
+            raise self._annotate_error(OutOfData(), position=position)
 
     def _read_header(self):
+        object_start = self._absolute_offset(self._buff_i)
+        try:
+            return self._read_header_data()
+        except Exception as exc:
+            self._annotate_error(exc, position=object_start)
+            raise
+
+    def _read_header_data(self):
         typ = TYPE_IMMEDIATE
         n = 0
         obj = None
@@ -496,27 +625,63 @@ class Unpacker:
             raise FormatError("Unknown header: 0x%x" % b)
         return typ, n, obj
 
-    def _unpack(self, execute=EX_CONSTRUCT):
+    def _unpack_with_component(self, execute, component):
+        return self._unpack(execute, component)
+
+    def _unpack(self, execute=EX_CONSTRUCT, path_component=None):
+        object_start = self._absolute_offset(self._buff_i)
+        push_frame = True
+        if push_frame:
+            if path_component is None or len(self._error_stack) <= MAX_ERROR_PATH_DEPTH:
+                self._error_stack.append([object_start, path_component])
+            elif len(self._error_stack) == MAX_ERROR_PATH_DEPTH + 1:
+                self._error_stack.append([object_start, PATH_TRUNCATED])
+            else:
+                push_frame = False
+        try:
+            return self._unpack_data(execute, object_start)
+        except RecursionError as exc:
+            self._annotate_error(exc)
+            raise
+        except Exception as exc:
+            self._annotate_error(exc)
+            raise
+        finally:
+            if push_frame:
+                self._error_stack.pop()
+            if not self._error_stack:
+                self._annotated_exception_ids.clear()
+
+    def _validate_map_key(self, key, object_start=None):
+        if self._strict_map_key and type(key) not in (str, bytes):
+            path = self._error_path() + (UNKNOWN_MAP_KEY,)
+            raise self._annotate_error(
+                ValueError("%s is not allowed for map key" % type(key).__name__),
+                position=object_start,
+                path=path,
+            )
+
+    def _unpack_data(self, execute, object_start):
         typ, n, obj = self._read_header()
 
         if execute == EX_READ_ARRAY_HEADER:
             if typ != TYPE_ARRAY:
-                raise ValueError("Expected array")
+                raise self._annotate_error(ValueError("Expected array"))
             return n
         if execute == EX_READ_MAP_HEADER:
             if typ != TYPE_MAP:
-                raise ValueError("Expected map")
+                raise self._annotate_error(ValueError("Expected map"))
             return n
         # TODO should we eliminate the recursion?
         if typ == TYPE_ARRAY:
             if execute == EX_SKIP:
                 for i in range(n):
                     # TODO check whether we need to call `list_hook`
-                    self._unpack(EX_SKIP)
+                    self._unpack_with_component(EX_SKIP, i)
                 return
             ret = newlist_hint(n)
             for i in range(n):
-                ret.append(self._unpack(EX_CONSTRUCT))
+                ret.append(self._unpack_with_component(EX_CONSTRUCT, i))
             if self._list_hook is not None:
                 ret = self._list_hook(ret)
             # TODO is the interaction between `list_hook` and `use_list` ok?
@@ -525,28 +690,31 @@ class Unpacker:
             if execute == EX_SKIP:
                 for i in range(n):
                     # TODO check whether we need to call hooks
-                    self._unpack(EX_SKIP)
-                    self._unpack(EX_SKIP)
+                    self._unpack_with_component(EX_SKIP, UNKNOWN_MAP_KEY)
+                    self._unpack_with_component(EX_SKIP, i)
                 return
             if self._object_pairs_hook is not None:
 
                 def _gen():
-                    for _ in range(n):
-                        key = self._unpack(EX_CONSTRUCT)
-                        if self._strict_map_key and type(key) not in (str, bytes):
-                            raise ValueError("%s is not allowed for map key" % str(type(key)))
-                        yield key, self._unpack(EX_CONSTRUCT)
+                    for i in range(n):
+                        key_start = self._absolute_offset(self._buff_i)
+                        key = self._unpack_with_component(EX_CONSTRUCT, UNKNOWN_MAP_KEY)
+                        self._validate_map_key(key, key_start)
+                        component = _bounded_path_component(key)
+                        value = self._unpack_with_component(EX_CONSTRUCT, component)
+                        yield key, value
 
                 ret = self._object_pairs_hook(_gen())
             else:
                 ret = {}
-                for _ in range(n):
-                    key = self._unpack(EX_CONSTRUCT)
-                    if self._strict_map_key and type(key) not in (str, bytes):
-                        raise ValueError("%s is not allowed for map key" % str(type(key)))
+                for i in range(n):
+                    key_start = self._absolute_offset(self._buff_i)
+                    key = self._unpack_with_component(EX_CONSTRUCT, UNKNOWN_MAP_KEY)
+                    self._validate_map_key(key, key_start)
                     if isinstance(key, str):
                         key = sys.intern(key)
-                    ret[key] = self._unpack(EX_CONSTRUCT)
+                    component = _bounded_path_component(key)
+                    ret[key] = self._unpack_with_component(EX_CONSTRUCT, component)
                 if self._object_hook is not None:
                     ret = self._object_hook(ret)
             return ret
@@ -556,7 +724,14 @@ class Unpacker:
             if self._raw:
                 obj = bytes(obj)
             else:
-                obj = obj.decode("utf_8", self._unicode_errors)
+                data_start = self._absolute_offset() - len(obj)
+                try:
+                    obj = obj.decode("utf_8", self._unicode_errors)
+                except UnicodeDecodeError as exc:
+                    raise self._annotate_error(
+                        exc,
+                        position=data_start + (exc.start or 0),
+                    )
             return obj
         if typ == TYPE_BIN:
             return bytes(obj)
@@ -587,23 +762,23 @@ class Unpacker:
         except OutOfData:
             self._consume()
             raise StopIteration
-        except RecursionError:
-            raise StackError
+        except RecursionError as exc:
+            raise self._replace_exception(exc, StackError()) from exc
 
     next = __next__
 
     def skip(self):
         try:
             self._unpack(EX_SKIP)
-        except RecursionError:
-            raise StackError
+        except RecursionError as exc:
+            raise self._replace_exception(exc, StackError()) from exc
         self._consume()
 
     def unpack(self):
         try:
             ret = self._unpack(EX_CONSTRUCT)
-        except RecursionError:
-            raise StackError
+        except RecursionError as exc:
+            raise self._replace_exception(exc, StackError()) from exc
         self._consume()
         return ret
 

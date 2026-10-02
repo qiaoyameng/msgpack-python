@@ -1,3 +1,6 @@
+from collections import namedtuple
+
+
 class UnpackException(Exception):
     """Base class for some exceptions raised while unpacking.
 
@@ -12,6 +15,7 @@ class BufferFull(UnpackException):
 
 
 class OutOfData(UnpackException):
+    """More bytes are required to finish unpacking the current object."""
     pass
 
 
@@ -21,6 +25,14 @@ class FormatError(ValueError, UnpackException):
 
 class StackError(ValueError, UnpackException):
     """Too nested"""
+
+
+#: Structured details attached to exceptions raised by the pure Python unpacker.
+#:
+#: ``position`` is the absolute byte offset where unpacking failed,
+#: ``object_start`` is the absolute byte offset where the current record started,
+#: and ``path`` is a bounded tuple of array indices and bounded map keys.
+UnpackErrorInfo = namedtuple("UnpackErrorInfo", "position object_start path")
 
 
 # Deprecated.  Use ValueError instead
