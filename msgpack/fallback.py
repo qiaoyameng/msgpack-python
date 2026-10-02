@@ -66,6 +66,133 @@ TYPE_EXT = 5
 DEFAULT_RECURSE_LIMIT = 1024
 
 
+class ArrayCursor:
+    """Iterates over the items of a single msgpack array, one at a time.
+
+    Created by :meth:`Unpacker.array_cursor`.  The cursor holds the
+    remaining item count of the array and constructs only the next item
+    on each call, so a large top-level array of independent records can
+    be consumed without building the whole Python list.
+
+    While the cursor is alive, other unpack operations on the owning
+    Unpacker (``unpack``, ``skip``, ``read_array_header``,
+    ``read_map_header``, ``read_bytes`` and iteration) raise
+    ``RuntimeError``: no new message may be started from the middle of
+    the array.  ``feed`` stays usable; when the buffer runs out,
+    ``OutOfData`` is raised and the same call can be retried after
+    feeding more data.
+
+    The cursor is a context manager; leaving the ``with`` block closes
+    it with the default draining policy (see :meth:`close`).
+    """
+
+    def __init__(self, unpacker, remaining):
+        self._unpacker = unpacker
+        self._remaining = remaining
+        self._closed = False
+
+    @property
+    def remaining(self):
+        """Number of array items not consumed yet."""
+        return self._remaining
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        if self._remaining == 0:
+            self._detach()
+            raise StopIteration
+        item = self._step(EX_CONSTRUCT)
+        return item
+
+    next = __next__
+
+    def skip(self):
+        """Skip the next item without constructing it."""
+        if self._closed:
+            raise RuntimeError("ArrayCursor is closed")
+        if self._remaining == 0:
+            self._detach()
+            raise StopIteration
+        self._step(EX_SKIP)
+
+    def _step(self, execute):
+        unpacker = self._unpacker
+        try:
+            ret = unpacker._unpack(execute)
+        except OutOfData:
+            # Buffer rolled back to the last item boundary; the caller
+            # may feed() more data and retry.
+            raise
+        except RecursionError:
+            self._break_owner()
+            raise StackError
+        except Exception:
+            # The buffer position is no longer reliable.
+            self._break_owner()
+            raise
+        unpacker._consume()
+        self._remaining -= 1
+        if self._remaining == 0:
+            self._detach()
+        return ret
+
+    def _break_owner(self):
+        unpacker = self._unpacker
+        if unpacker is not None:
+            unpacker._broken = True
+        self._detach()
+
+    def _detach(self):
+        self._closed = True
+        unpacker = self._unpacker
+        self._unpacker = None
+        if unpacker is not None and unpacker._cursor is self:
+            unpacker._cursor = None
+
+    def close(self, drain=True):
+        """Close the cursor before the array is exhausted.
+
+        If *drain* is true (default), the remaining items are skipped so
+        the unpacker stays positioned exactly at the next message.
+        Draining honors the unpacker's buffer and depth limits.
+        ``OutOfData`` propagates and the cursor stays open, so the
+        caller can feed more data and call ``close()`` again.
+
+        If *drain* is false and items remain, the unpacker cannot know
+        where the array ends; it enters an inconsistent state and must
+        be reset (see :meth:`Unpacker.reset`) or discarded before
+        further use.
+        """
+        if self._closed:
+            return
+        if drain:
+            try:
+                while self._remaining:
+                    self.skip()
+            except OutOfData:
+                # Retriable after feed(); the cursor stays open.
+                raise
+        else:
+            if self._remaining:
+                self._unpacker._broken = True
+            self._detach()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+
 def _check_type_strict(obj, t, type=type, tuple=tuple):
     if type(t) is tuple:
         return type(obj) in t
@@ -271,6 +398,13 @@ class Unpacker:
         #: Which position we currently reads
         self._buff_i = 0
 
+        #: Active ArrayCursor, if any.  While set, other unpack
+        #: operations are rejected.
+        self._cursor = None
+        #: Set when the buffer position is no longer reliable (e.g. an
+        #: array cursor was closed without draining).  Requires reset().
+        self._broken = False
+
         # When Unpacker is used as an iterable, between the calls to next(),
         # the buffer is not "consumed" completely, for efficiency sake.
         # Instead, it is done sloppily.  To make sure we raise BufferFull at
@@ -342,6 +476,34 @@ class Unpacker:
         self._buffer.extend(view if view.contiguous else view.tobytes())
         view.release()
 
+    def reset(self):
+        """Discard all buffered data and return to a clean state.
+
+        Required after an :class:`ArrayCursor` was closed without
+        draining, or after an unpack operation failed midway.
+        """
+        self._buffer = bytearray()
+        self._buff_i = 0
+        self._buf_checkpoint = 0
+        self._stream_offset = 0
+        self._broken = False
+        cursor = self._cursor
+        if cursor is not None:
+            cursor._closed = True
+            cursor._unpacker = None
+            self._cursor = None
+
+    def _check_ready(self):
+        if self._broken:
+            raise RuntimeError(
+                "Unpacker is in an inconsistent state; call reset() or use a new Unpacker"
+            )
+        if self._cursor is not None:
+            raise RuntimeError(
+                "An ArrayCursor is active; consume or close it before "
+                "starting other unpack operations"
+            )
+
     def _consume(self):
         """Gets rid of the used parts of the buffer."""
         self._stream_offset += self._buff_i - self._buf_checkpoint
@@ -354,6 +516,7 @@ class Unpacker:
         return self._buffer[self._buff_i :]
 
     def read_bytes(self, n):
+        self._check_ready()
         ret = self._read(n, raise_outofdata=False)
         self._consume()
         return ret
@@ -580,6 +743,7 @@ class Unpacker:
         return self
 
     def __next__(self):
+        self._check_ready()
         try:
             ret = self._unpack(EX_CONSTRUCT)
             self._consume()
@@ -593,6 +757,7 @@ class Unpacker:
     next = __next__
 
     def skip(self):
+        self._check_ready()
         try:
             self._unpack(EX_SKIP)
         except RecursionError:
@@ -600,6 +765,7 @@ class Unpacker:
         self._consume()
 
     def unpack(self):
+        self._check_ready()
         try:
             ret = self._unpack(EX_CONSTRUCT)
         except RecursionError:
@@ -608,14 +774,35 @@ class Unpacker:
         return ret
 
     def read_array_header(self):
+        self._check_ready()
         ret = self._unpack(EX_READ_ARRAY_HEADER)
         self._consume()
         return ret
 
     def read_map_header(self):
+        self._check_ready()
         ret = self._unpack(EX_READ_MAP_HEADER)
         self._consume()
         return ret
+
+    def array_cursor(self):
+        """Read an array header and return an :class:`ArrayCursor`.
+
+        The cursor yields the array's items one at a time instead of
+        building the whole list, which suits a large top-level array of
+        independent records.  While the cursor is alive, other unpack
+        operations on this unpacker raise ``RuntimeError``.
+
+        Raises ``OutOfData`` when the header is incomplete; feed more
+        data and call again.  Raises ``ValueError`` when the next
+        object is not an array.
+        """
+        self._check_ready()
+        n = self._unpack(EX_READ_ARRAY_HEADER)
+        self._consume()
+        cursor = ArrayCursor(self, n)
+        self._cursor = cursor
+        return cursor
 
     def tell(self):
         return self._stream_offset
