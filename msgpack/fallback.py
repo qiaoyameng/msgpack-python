@@ -210,6 +210,24 @@ class Unpacker:
         Deprecated, use *max_buffer_size* instead.
         Limits max size of ext type.  (default: max_buffer_size)
 
+    :param bool bin_views:
+        If true, unpack msgpack bin to a read-only ``memoryview`` instead of
+        ``bytes``.  This avoids copying binary payloads, which is useful when
+        they are forwarded to another encoder.  Returned views stay valid
+        across subsequent ``feed()``/unpack calls and internal buffer
+        compaction, and are not affected by later mutation of mutable objects
+        passed to ``feed()`` (fed data is copied on ``feed()``).  Release a
+        view with ``memoryview.release()`` when it is no longer needed.
+        (default: False)
+
+    :param int max_view_retain:
+        Maximum number of extra bytes a view returned in *bin_views* mode may
+        keep alive beyond its own length.  Views over consecutive bin fields
+        share one immutable snapshot of the buffer to avoid per-field copies;
+        when a bin field is smaller than the rest of the buffered stream by
+        more than this amount, the field is copied instead, so that retaining
+        a small view cannot pin the whole stream.  (default: 1MiB)
+
     Example of streaming deserialize from file-like object::
 
         unpacker = Unpacker(file_like)
@@ -254,6 +272,8 @@ class Unpacker:
         max_array_len=-1,
         max_map_len=-1,
         max_ext_len=-1,
+        bin_views=False,
+        max_view_retain=1024 * 1024,
     ):
         if unicode_errors is None:
             unicode_errors = "strict"
@@ -315,6 +335,16 @@ class Unpacker:
         self._max_ext_len = max_ext_len
         self._stream_offset = 0
 
+        if max_view_retain < 0:
+            raise ValueError("max_view_retain must be >= 0")
+        self._bin_views = bool(bin_views)
+        self._max_view_retain = max_view_retain
+        # Immutable snapshot handed out as views, shared by consecutive bin
+        # fields.  Invalidated whenever the buffer is compacted.  Views keep
+        # it alive only as long as they need it.
+        self._view_base = None
+        self._view_base_off = 0
+
         if list_hook is not None and not callable(list_hook):
             raise TypeError("`list_hook` is not callable")
         if object_hook is not None and not callable(object_hook):
@@ -337,6 +367,7 @@ class Unpacker:
             del self._buffer[: self._buf_checkpoint]
             self._buff_i -= self._buf_checkpoint
             self._buf_checkpoint = 0
+            self._view_base = None
 
         # Use extend here: INPLACE_ADD += doesn't reliably typecast memoryview in jython
         self._buffer.extend(view if view.contiguous else view.tobytes())
@@ -382,6 +413,7 @@ class Unpacker:
             del self._buffer[: self._buf_checkpoint]
             self._buff_i -= self._buf_checkpoint
             self._buf_checkpoint = 0
+            self._view_base = None
 
         # Read from file
         remain_bytes = -remain_bytes
@@ -400,7 +432,31 @@ class Unpacker:
             self._buff_i = 0  # rollback
             raise OutOfData
 
-    def _read_header(self):
+    def _read_view(self, n):
+        self._reserve(n)
+        i = self._buff_i
+        self._buff_i = i + n
+        return self._make_view(i, n)
+
+    def _make_view(self, i, n):
+        base = self._view_base
+        if base is not None:
+            start = i - self._view_base_off
+            if 0 <= start and start + n <= len(base):
+                return memoryview(base)[start : start + n]
+        # Snapshot the buffer as immutable bytes so the view stays valid
+        # across feed()/unpack() calls and buffer compaction.  If the
+        # remaining buffer is much larger than the field, copy only the
+        # field so a small view cannot retain the whole stream.
+        if len(self._buffer) - i - n > self._max_view_retain:
+            base = bytes(self._buffer[i : i + n])
+        else:
+            base = bytes(self._buffer[i:])
+        self._view_base = base
+        self._view_base_off = i
+        return memoryview(base)[:n]
+
+    def _read_header(self, execute=EX_CONSTRUCT):
         typ = TYPE_IMMEDIATE
         n = 0
         obj = None
@@ -443,7 +499,10 @@ class Unpacker:
             self._buff_i += size
             if n > self._max_bin_len:
                 raise ValueError(f"{n} exceeds max_bin_len({self._max_bin_len})")
-            obj = self._read(n)
+            if self._bin_views and execute != EX_SKIP:
+                obj = self._read_view(n)
+            else:
+                obj = self._read(n)
         elif 0xC7 <= b <= 0xC9:
             size, fmt, typ = _MSGPACK_HEADERS[b]
             self._reserve(size)
@@ -497,7 +556,7 @@ class Unpacker:
         return typ, n, obj
 
     def _unpack(self, execute=EX_CONSTRUCT):
-        typ, n, obj = self._read_header()
+        typ, n, obj = self._read_header(execute)
 
         if execute == EX_READ_ARRAY_HEADER:
             if typ != TYPE_ARRAY:
@@ -559,6 +618,8 @@ class Unpacker:
                 obj = obj.decode("utf_8", self._unicode_errors)
             return obj
         if typ == TYPE_BIN:
+            if self._bin_views:
+                return obj
             return bytes(obj)
         if typ == TYPE_EXT:
             if n == -1:  # timestamp

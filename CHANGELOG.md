@@ -1,3 +1,10 @@
+# Unreleased
+
+- Add `bin_views` option to the pure Python `Unpacker` to unpack msgpack bin
+  as read-only `memoryview` instead of `bytes`, avoiding per-field copies.
+  Views stay valid across `feed()`/unpack calls and buffer compaction, and
+  `max_view_retain` bounds how much extra buffer a small view may keep alive.
+
 # 1.2.3
 
 Release Date: 2026-09-29
