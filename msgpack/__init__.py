@@ -16,6 +16,17 @@ else:
     except ImportError:
         from .fallback import Packer, Unpacker, unpackb
 
+from .binary_edit import (
+    AmbiguousKeyError,
+    DuplicateKeyError,
+    InvalidPathError,
+    PathEditError,
+    PathNotFoundError,
+    delete_at,
+    insert_at,
+    replace_at,
+)
+
 
 def pack(o, stream, **kwargs):
     """
